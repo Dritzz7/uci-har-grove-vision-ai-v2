@@ -1,0 +1,26 @@
+# Local environments and caches
+.venv/
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Downloaded datasets and large intermediate arrays
+dataset/
+*.npy
+*.npz
+
+# Local SDK checkouts and build trees
+third_party/
+Seeed_Grove_Vision_AI_Module_V2/
+build/
+obj_*/
+
+# Generated Vela scratch files
+vela_out/
+*_preamble_data.bin
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
