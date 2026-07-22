@@ -1,0 +1,1 @@
+ethos-u-vela==4.2.0

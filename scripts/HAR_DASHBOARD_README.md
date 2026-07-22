@@ -15,9 +15,9 @@ Run this first to check the interface without hardware:
 ```bash
 cd /path/to/uci-har-grove-vision-ai-v2
 
-.venv/bin/python \
-scripts/har_dashboard.py \
---demo
+.venv-device/bin/python \
+  scripts/har_dashboard.py \
+  --demo
 ```
 
 Open this address in a browser:
@@ -36,10 +36,10 @@ miniterm or any other program using the serial device, then run:
 ```bash
 cd /path/to/uci-har-grove-vision-ai-v2
 
-.venv/bin/python \
-scripts/har_dashboard.py \
---serial-port=/dev/ttyACM0 \
---baudrate=921600
+.venv-device/bin/python \
+  scripts/har_dashboard.py \
+  --serial-port=/dev/ttyACM0 \
+  --baudrate=921600
 ```
 
 Open:
@@ -51,8 +51,8 @@ http://127.0.0.1:8765
 If PySerial is missing from the WSL virtual environment:
 
 ```bash
-.venv/bin/python \
--m pip install pyserial==3.5
+.venv-device/bin/python -m pip install \
+  -r requirements-device.txt
 ```
 
 ## Expected firmware message
