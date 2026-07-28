@@ -52,6 +52,24 @@ CONFIDENCE_RE = re.compile(
     r"(?P<confidence>[+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*(?P<percent>%)?",
     re.IGNORECASE,
 )
+SENSOR_READY_RE = re.compile(
+    r"(?:HW-123/MPU6050 ready|IMU_STATUS:\s*(?:READY|RECOVERED))",
+    re.IGNORECASE,
+)
+SENSOR_RECONNECTING_RE = re.compile(
+    r"IMU_STATUS:\s*(?:INITIALIZING|RECONNECTING)",
+    re.IGNORECASE,
+)
+SENSOR_ERROR_RE = re.compile(
+    r"(?:IMU_STATUS:\s*DISCONNECTED|"
+    r"HW-123/MPU6050 initialisation failed|"
+    r"MPU6050 (?:sample timeout/read error|I2C read error)|"
+    r"HAR I2C error|Failed to acquire HAR IMU window)",
+    re.IGNORECASE,
+)
+
+PREDICTION_STALE_SECONDS = 5.0
+SERIAL_STALE_SECONDS = 5.0
 
 
 @dataclass(frozen=True)
@@ -66,8 +84,10 @@ class DashboardState:
         self._lock = threading.Lock()
         self.serial_port = serial_port
         self.connected = False
+        self.sensor_connected: Optional[bool] = None
         self.status = "Waiting for serial device"
         self.last_line = ""
+        self.last_serial_activity: Optional[float] = None
         self.last_prediction: Optional[Prediction] = None
         self.history: deque[Prediction] = deque(maxlen=60)
         self.revision = 0
@@ -77,30 +97,72 @@ class DashboardState:
             if self.connected != connected or self.status != status:
                 self.connected = connected
                 self.status = status
+                if not connected:
+                    self.sensor_connected = None
                 self.revision += 1
 
-    def set_last_line(self, line: str) -> None:
+    def note_serial_line(self, line: str) -> None:
         with self._lock:
             self.last_line = line[-300:]
+            self.last_serial_activity = time.time()
+
+    def set_sensor(self, connected: Optional[bool], status: str) -> None:
+        with self._lock:
+            if self.sensor_connected != connected or self.status != status:
+                self.sensor_connected = connected
+                self.status = status
+                self.revision += 1
 
     def add_prediction(self, prediction: Prediction) -> None:
         with self._lock:
+            self.sensor_connected = True
+            self.status = f"Live predictions from {self.serial_port}"
             self.last_prediction = prediction
             self.history.append(prediction)
             self.revision += 1
 
     def snapshot(self) -> dict:
         with self._lock:
+            now = time.time()
+            prediction_age = (
+                now - self.last_prediction.timestamp
+                if self.last_prediction is not None
+                else None
+            )
+            serial_age = (
+                now - self.last_serial_activity
+                if self.last_serial_activity is not None
+                else None
+            )
+            prediction_stale = (
+                self.last_prediction is None
+                or prediction_age is None
+                or prediction_age > PREDICTION_STALE_SECONDS
+                or self.sensor_connected is False
+            )
+            stream_live = (
+                self.connected
+                and (serial_age is None or serial_age <= SERIAL_STALE_SECONDS)
+            )
+            status = self.status
+            if self.connected and serial_age is not None:
+                if serial_age > SERIAL_STALE_SECONDS:
+                    status = f"Serial connected, but no data for {int(serial_age)} s"
+
             return {
                 "serial_port": self.serial_port,
                 "connected": self.connected,
-                "status": self.status,
+                "stream_live": stream_live,
+                "sensor_connected": self.sensor_connected,
+                "status": status,
                 "last_prediction": (
                     asdict(self.last_prediction) if self.last_prediction else None
                 ),
+                "prediction_age": prediction_age,
+                "prediction_stale": prediction_stale,
                 "history": [asdict(item) for item in self.history],
                 "revision": self.revision,
-                "server_time": time.time(),
+                "server_time": now,
             }
 
 
@@ -169,7 +231,21 @@ def serial_worker(
                 if not line:
                     continue
 
-                state.set_last_line(line)
+                state.note_serial_line(line)
+
+                if SENSOR_READY_RE.search(line):
+                    state.set_sensor(True, "Sensor ready; collecting IMU window")
+                elif SENSOR_RECONNECTING_RE.search(line):
+                    state.set_sensor(
+                        False,
+                        "Sensor reconnecting; keep the HW-123 completely still",
+                    )
+                elif SENSOR_ERROR_RE.search(line):
+                    state.set_sensor(
+                        False,
+                        "Sensor unavailable; firmware is retrying automatically",
+                    )
+
                 prediction = parse_prediction(line)
                 if prediction:
                     state.add_prediction(prediction)
@@ -347,10 +423,11 @@ HTML = r"""<!doctype html>
       snapshot = data;
       document.getElementById("serial-port").textContent = data.serial_port;
       document.getElementById("status-text").textContent = data.status;
-      document.getElementById("status-dot").classList.toggle("online", data.connected);
+      const healthy = data.connected && data.stream_live && data.sensor_connected !== false;
+      document.getElementById("status-dot").classList.toggle("online", healthy);
 
       const prediction = data.last_prediction;
-      if (prediction) {
+      if (prediction && !data.prediction_stale) {
         document.getElementById("activity").textContent = prediction.activity;
         document.getElementById("activity-icon").textContent = icons[prediction.activity] || "●";
         const value = prediction.confidence;
@@ -361,6 +438,24 @@ HTML = r"""<!doctype html>
         meter.setAttribute("aria-valuenow", percent == null ? "0" : String(percent));
         document.getElementById("last-update").textContent = `Updated ${new Date(prediction.timestamp * 1000).toLocaleTimeString()}`;
         document.querySelectorAll(".class-pill").forEach(item => item.classList.toggle("active", item.dataset.activity === prediction.activity));
+      } else {
+        let message = "Waiting for data…";
+        if (!data.connected) {
+          message = "Serial disconnected";
+        } else if (data.sensor_connected === false) {
+          message = "Sensor unavailable";
+        } else if (prediction) {
+          message = "Prediction stale";
+        }
+        document.getElementById("activity").textContent = message;
+        document.getElementById("activity-icon").textContent = "⚠";
+        document.getElementById("confidence").textContent = "—";
+        document.getElementById("confidence-bar").style.width = "0%";
+        document.querySelector(".meter").setAttribute("aria-valuenow", "0");
+        document.querySelectorAll(".class-pill").forEach(item => item.classList.remove("active"));
+        document.getElementById("last-update").textContent = prediction
+          ? `Last valid prediction ${new Date(prediction.timestamp * 1000).toLocaleTimeString()}`
+          : "No prediction received";
       }
       drawChart();
     }

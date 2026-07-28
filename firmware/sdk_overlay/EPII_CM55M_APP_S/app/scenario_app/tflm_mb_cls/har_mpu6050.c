@@ -26,6 +26,8 @@
 #define DEG_TO_RAD                0.01745329251994329577f
 #define CALIBRATION_SAMPLES       200U
 #define READY_TIMEOUT_MS          50U
+#define RECONNECT_DELAY_MS        1000U
+#define READ_FAILURES_BEFORE_REINIT 3U
 
 typedef struct {
     float value[3];
@@ -65,6 +67,7 @@ static float g_gyro_bias_raw[3];
 static float g_window[HAR_WINDOW_SAMPLES][HAR_INPUT_CHANNELS];
 static uint32_t g_write_index;
 static uint32_t g_valid_samples;
+static uint32_t g_consecutive_read_failures;
 static bool g_ready;
 
 static void i2c_error_cb(void *status)
@@ -93,12 +96,17 @@ static int16_t be_i16(const uint8_t *data)
 static int read_raw(int16_t accel[3], int16_t gyro[3])
 {
     uint32_t elapsed;
+    int read_status;
     uint8_t status = 0U;
     uint8_t raw[14];
 
     for (elapsed = 0; elapsed < READY_TIMEOUT_MS; ++elapsed) {
-        if (read_regs(REG_INT_STATUS, &status, 1) == 0 &&
-            (status & DATA_READY) != 0U) {
+        read_status = read_regs(REG_INT_STATUS, &status, 1);
+        if (read_status != 0) {
+            xprintf("MPU6050 I2C read error\r\n");
+            return -1;
+        }
+        if ((status & DATA_READY) != 0U) {
             break;
         }
         hx_drv_timer_cm55x_delay_ms(1, TIMER_STATE_DC);
@@ -280,7 +288,10 @@ int har_mpu6050_init(void)
     memset(g_gravity, 0, sizeof(g_gravity));
     memset(g_window, 0, sizeof(g_window));
     g_write_index = g_valid_samples = 0U;
+    g_consecutive_read_failures = 0U;
     g_ready = false;
+
+    xprintf("IMU_STATUS: INITIALIZING - keep sensor still\r\n");
 
     hx_drv_scu_set_PA2_pinmux(SCU_PA2_PINMUX_I2C_M_SCL, 1);
     hx_drv_scu_set_PA3_pinmux(SCU_PA3_PINMUX_I2C_M_SDA, 1);
@@ -309,6 +320,7 @@ int har_mpu6050_init(void)
 
     g_ready = true;
     xprintf("HW-123/MPU6050 ready at 0x68, 50 Hz\r\n");
+    xprintf("IMU_STATUS: READY\r\n");
     return 0;
 }
 
@@ -317,14 +329,47 @@ int har_mpu6050_fill_window(int8_t *tensor, size_t tensor_bytes,
 {
     uint32_t collect, sample, channel;
 
-    if (!g_ready || tensor == NULL || input_scale <= 0.0f ||
-        tensor_bytes != HAR_WINDOW_SAMPLES * HAR_INPUT_CHANNELS) return -1;
+    if (tensor == NULL || input_scale <= 0.0f ||
+        tensor_bytes != HAR_WINDOW_SAMPLES * HAR_INPUT_CHANNELS) {
+        return -1;
+    }
+
+    /*
+     * A disconnected VCC jumper power-cycles the MPU6050 and clears all of
+     * its configuration registers. Merely retrying a sample is therefore not
+     * sufficient after the wire is reconnected. Reinitialise the I2C
+     * controller and sensor here so recovery does not require a board reset
+     * or reopening the serial dashboard.
+     */
+    if (!g_ready) {
+        xprintf("IMU_STATUS: RECONNECTING - keep sensor still\r\n");
+        hx_drv_timer_cm55x_delay_ms(RECONNECT_DELAY_MS, TIMER_STATE_DC);
+        if (har_mpu6050_init() != 0) {
+            xprintf("IMU_STATUS: DISCONNECTED - automatic retry pending\r\n");
+            return -1;
+        }
+        xprintf("IMU_STATUS: RECOVERED\r\n");
+    }
+
     collect = g_valid_samples < HAR_WINDOW_SAMPLES
                   ? HAR_WINDOW_SAMPLES - g_valid_samples
                   : HAR_WINDOW_STRIDE;
 
     for (sample = 0; sample < collect; ++sample) {
-        if (processed_sample(g_window[g_write_index]) != 0) return -1;
+        if (processed_sample(g_window[g_write_index]) != 0) {
+            ++g_consecutive_read_failures;
+            if (g_consecutive_read_failures >= READ_FAILURES_BEFORE_REINIT) {
+                g_ready = false;
+                g_write_index = 0U;
+                g_valid_samples = 0U;
+                memset(g_window, 0, sizeof(g_window));
+                xprintf(
+                    "IMU_STATUS: DISCONNECTED - automatic recovery enabled\r\n"
+                );
+            }
+            return -1;
+        }
+        g_consecutive_read_failures = 0U;
         g_write_index = (g_write_index + 1U) % HAR_WINDOW_SAMPLES;
         if (g_valid_samples < HAR_WINDOW_SAMPLES) ++g_valid_samples;
     }

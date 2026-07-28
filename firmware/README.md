@@ -37,6 +37,12 @@ Processing is performed at 50 Hz:
 Gyroscope bias is calibrated for four seconds during startup. Keep the sensor
 completely still until calibration finishes.
 
+If an MPU6050 jumper is disconnected while the system is running, the firmware
+marks the current window invalid and automatically retries sensor
+initialisation. After reconnecting all wires, keep the sensor still while the
+four-second gyroscope calibration runs again. A board reset or dashboard
+restart is not required.
+
 ## Debug output
 
 `HAR_AXIS_DEBUG_PRINT` in `har_mpu6050.h` controls the once-per-second raw

@@ -76,3 +76,7 @@ firmware prints the confidence on the same line as the activity prediction.
 - `No such file`: reattach the USB device to WSL and confirm the device name.
 - Dashboard opens but remains on `Waiting`: press the board reset button and
   watch the connection indicator.
+- If an IMU jumper is disconnected, the current prediction is marked stale
+  instead of remaining displayed as live data. Reconnect the jumper and keep
+  the sensor still while the firmware automatically reinitialises and
+  recalibrates it.
